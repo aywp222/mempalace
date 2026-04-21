@@ -632,20 +632,39 @@ def status(palace_path: str):
         print("  Run: mempalace init <dir> then mempalace mine <dir>")
         return
 
-    # Count by wing and room
-    r = col.get(limit=10000, include=["metadatas"])
-    metas = r["metadatas"]
-
+    # Count by wing and room — use col.count() for total; fetch metadatas in batches
+    total = col.count()
     wing_rooms = defaultdict(lambda: defaultdict(int))
-    for m in metas:
-        wing_rooms[m.get("wing", "?")][m.get("room", "?")] += 1
+    batch_size = 10000
+    offset = 0
+    while offset < total:
+        r = col.get(limit=batch_size, offset=offset, include=["metadatas"])
+        for m in r["metadatas"]:
+            wing_rooms[m.get("wing", "?")][m.get("room", "?")] += 1
+        offset += batch_size
+
+    # Calculate disk usage of the whole palace directory
+    palace_dir = Path(palace_path).parent  # ~/.mempalace/
+    total_bytes = sum(
+        f.stat().st_size
+        for f in palace_dir.rglob("*")
+        if f.is_file()
+    )
+    if total_bytes >= 1024 ** 3:
+        size_str = f"{total_bytes / 1024 ** 3:.1f} GB"
+    elif total_bytes >= 1024 ** 2:
+        size_str = f"{total_bytes / 1024 ** 2:.1f} MB"
+    else:
+        size_str = f"{total_bytes / 1024:.1f} KB"
 
     print(f"\n{'=' * 55}")
-    print(f"  MemPalace Status — {len(metas)} drawers")
+    print(f"  MemPalace Status — {total} drawers")
     print(f"{'=' * 55}\n")
     for wing, rooms in sorted(wing_rooms.items()):
         print(f"  WING: {wing}")
         for room, count in sorted(rooms.items(), key=lambda x: x[1], reverse=True):
             print(f"    ROOM: {room:20} {count:5} drawers")
         print()
+    print(f"{'=' * 55}")
+    print(f"  Disk usage: {size_str}")
     print(f"{'=' * 55}\n")
