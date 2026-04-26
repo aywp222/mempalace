@@ -137,6 +137,35 @@ cross-wing navigation, drawer management, and agent diaries. Installation
 and the full tool list:
 [mempalaceofficial.com/reference/mcp-tools](https://mempalaceofficial.com/reference/mcp-tools.html).
 
+### Local Shared Service Mode
+
+For multi-window editor usage, you can run one local HTTP service and keep
+MCP access on the same process:
+
+```bash
+./scripts/start_memory_service.sh
+```
+
+- On macOS this installs/uses `~/Library/LaunchAgents/com.mempalace.mcp-http.plist`
+	so one backend starts at login and survives editor restarts.
+- Use `./scripts/start_memory_service.sh --reinstall` after moving the checkout or
+	changing service paths.
+- MCP endpoint: `http://127.0.0.1:47291/mcp`
+- Health check: `http://127.0.0.1:47291/health`
+- Dual-layer bridge API: `http://127.0.0.1:47291/api/bridge/*`
+
+Noisy palaces can be reviewed without deleting original drawers:
+
+```bash
+mempalace distill --wing mshl --limit 2000
+```
+
+Add `--write` only when you want to store small distilled verbatim index
+drawers back into the palace.
+
+Bridge API examples and script usage:
+[`examples/local_memory_service.md`](examples/local_memory_service.md)
+
 ## Agents
 
 Each specialist agent gets its own wing and diary in the palace.

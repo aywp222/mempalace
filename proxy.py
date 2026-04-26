@@ -9,13 +9,13 @@ HNSW 索引只在 HTTP 服务器里加载一次，不会随 VS Code 窗口数量
 如果 HTTP 服务器未运行，代理会自动在后台启动它。
 """
 
-import sys
-import os
 import json
+import os
 import subprocess
+import sys
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 
 HTTP_URL = "http://127.0.0.1:47291/mcp"
 HEALTH_URL = "http://127.0.0.1:47291/health"
@@ -24,6 +24,15 @@ HEALTH_URL = "http://127.0.0.1:47291/health"
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PYTHON = os.path.join(_HERE, ".venv", "bin", "python")
 _SERVER = os.path.join(_HERE, "http_server.py")
+_START_SCRIPT = os.path.join(_HERE, "scripts", "start_memory_service.sh")
+_LAUNCH_LABEL = os.environ.get("MEMPALACE_LAUNCH_LABEL", "com.mempalace.mcp-http")
+_LAUNCH_PLIST = os.path.expanduser(f"~/Library/LaunchAgents/{_LAUNCH_LABEL}.plist")
+
+
+def _log_handle():
+    log_dir = os.path.expanduser("~/.mempalace/logs")
+    os.makedirs(log_dir, exist_ok=True)
+    return open(os.path.join(log_dir, "mcp-http-error.log"), "a")
 
 
 def _server_alive() -> bool:
@@ -38,14 +47,37 @@ def _ensure_server():
     """如果 HTTP 服务器没在运行，后台启动它并等待就绪。"""
     if _server_alive():
         return
-    log = open(os.path.expanduser("~/.mempalace/logs/mcp-http-error.log"), "a")
-    subprocess.Popen(
-        [_PYTHON, _SERVER, "--port", "47291", "--host", "127.0.0.1"],
-        cwd=_HERE,
-        stdout=log,
-        stderr=log,
-        start_new_session=True,  # 不随代理进程退出而停止
-    )
+
+    log = _log_handle()
+    if sys.platform == "darwin" and os.path.exists(_LAUNCH_PLIST):
+        subprocess.run(
+            ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{_LAUNCH_LABEL}"],
+            stdout=log,
+            stderr=log,
+            check=False,
+        )
+        for _ in range(10):
+            time.sleep(0.5)
+            if _server_alive():
+                return
+
+    if os.path.exists(_START_SCRIPT):
+        subprocess.Popen(
+            [_START_SCRIPT],
+            cwd=_HERE,
+            stdout=log,
+            stderr=log,
+            start_new_session=True,
+        )
+    else:
+        subprocess.Popen(
+            [_PYTHON, _SERVER, "--port", "47291", "--host", "127.0.0.1"],
+            cwd=_HERE,
+            stdout=log,
+            stderr=log,
+            start_new_session=True,
+        )
+
     # 最多等 15 秒
     for _ in range(30):
         time.sleep(0.5)

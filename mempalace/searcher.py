@@ -11,10 +11,30 @@ hide drawers the direct path would have found.
 
 import logging
 import math
+import os
 import re
+import traceback
 from pathlib import Path
 
 from .palace import get_closets_collection, get_collection
+
+# When set, never silently degrade to BM25; surface the underlying error
+# so HNSW/metadata divergence can be diagnosed rather than masked.
+_STRICT_SEARCH = os.environ.get("MEMPALACE_STRICT_SEARCH", "").lower() in ("1", "true", "yes")
+
+
+def _classify_chroma_error(exc: Exception) -> str:
+    """Best-effort classification of common Chroma failures so callers can
+    distinguish 'index needs repair' from 'bad query'.
+    """
+    msg = str(exc).lower()
+    if "error finding id" in msg or "finding id" in msg:
+        return "hnsw_metadata_orphan"
+    if "hnsw" in msg and "index" in msg:
+        return "hnsw_index_error"
+    if "where" in msg or "filter" in msg:
+        return "filter_error"
+    return "unknown"
 
 # Closet pointer line format: "topic|entities|→drawer_id_a,drawer_id_b"
 # Multiple lines may join with newlines inside one closet document.
@@ -43,6 +63,11 @@ def _first_or_empty(results, key: str) -> list:
     if not outer:
         return []
     return outer[0] or []
+
+
+def _result_field(results, key: str):
+    """Get a field from dict-like or object-like Chroma results."""
+    return getattr(results, key, None) if not isinstance(results, dict) else results.get(key)
 
 
 def _tokenize(text: str) -> list:
@@ -158,6 +183,77 @@ def build_where_filter(wing: str = None, room: str = None) -> dict:
     return {}
 
 
+def _fallback_filtered_bm25(drawers_col, query: str, where: dict, n_results: int, max_docs: int = 5000) -> dict:
+    """Fallback search when Chroma filtered vector query fails.
+
+    Chroma can raise `Internal error: Error finding id` when metadata and the
+    active HNSW index diverge. For filtered searches, degrade to a BM25 scan of
+    the filtered corpus instead of surfacing an opaque internal error.
+    """
+    page_size = 1000
+    offset = 0
+    docs: list[str] = []
+    metas: list[dict] = []
+
+    while offset < max_docs:
+        batch = drawers_col.get(
+            where=where,
+            include=["documents", "metadatas"],
+            limit=min(page_size, max_docs - offset),
+            offset=offset,
+        )
+        batch_ids = _result_field(batch, "ids") or []
+        batch_docs = _result_field(batch, "documents") or []
+        batch_metas = _result_field(batch, "metadatas") or []
+        if not batch_ids:
+            break
+        docs.extend(batch_docs)
+        metas.extend((m or {}) for m in batch_metas)
+        fetched = len(batch_ids)
+        offset += fetched
+        if fetched < page_size:
+            break
+
+    if not docs:
+        return {"results": [], "total_candidates": 0, "truncated": False}
+
+    bm25_raw = _bm25_scores(query, docs)
+    max_bm25 = max(bm25_raw) if bm25_raw else 0.0
+    bm25_norm = [s / max_bm25 for s in bm25_raw] if max_bm25 > 0 else [0.0] * len(bm25_raw)
+
+    ranked = sorted(
+        range(len(docs)),
+        key=lambda idx: (bm25_raw[idx], metas[idx].get("filed_at", "")),
+        reverse=True,
+    )
+
+    hits = []
+    for idx in ranked[:n_results]:
+        meta = metas[idx]
+        similarity = round(bm25_norm[idx], 3)
+        hits.append(
+            {
+                "text": docs[idx],
+                "wing": meta.get("wing", "unknown"),
+                "room": meta.get("room", "unknown"),
+                "source_file": Path(meta.get("source_file", "?")).name if meta.get("source_file") else "?",
+                "created_at": meta.get("filed_at", "unknown"),
+                "similarity": similarity,
+                "distance": round(1.0 - similarity, 4),
+                "effective_distance": round(1.0 - similarity, 4),
+                "closet_boost": 0.0,
+                "matched_via": "bm25-fallback",
+                "bm25_score": round(bm25_raw[idx], 3),
+            }
+        )
+
+    return {
+        "results": hits,
+        "total_candidates": len(docs),
+        "truncated": offset >= max_docs,
+    }
+
+
 def _extract_drawer_ids_from_closet(closet_doc: str) -> list:
     """Parse all `→drawer_id_a,drawer_id_b` pointers out of a closet document.
 
@@ -262,6 +358,32 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         results = col.query(**kwargs)
 
     except Exception as e:
+        if where:
+            fallback = _fallback_filtered_bm25(col, query, where, n_results)
+            if fallback["results"]:
+                print(f"\n  Search warning: vector query failed ({e})")
+                print("  Falling back to BM25 over the filtered corpus.")
+                print(f"  Candidates scanned: {fallback['total_candidates']}")
+                print()
+                print(f"{'=' * 60}")
+                print(f'  Results for: "{query}"')
+                if wing:
+                    print(f"  Wing: {wing}")
+                if room:
+                    print(f"  Room: {room}")
+                print(f"{'=' * 60}\n")
+
+                for i, hit in enumerate(fallback["results"], 1):
+                    print(f"  [{i}] {hit['wing']} / {hit['room']}")
+                    print(f"      Source: {hit['source_file']}")
+                    print(f"      Match:  {hit['similarity']}")
+                    print()
+                    for line in hit["text"].strip().split("\n"):
+                        print(f"      {line}")
+                    print()
+                    print(f"  {'─' * 56}")
+                print()
+                return
         print(f"\n  Search error: {e}")
         raise SearchError(f"Search error: {e}") from e
 
@@ -352,7 +474,38 @@ def search_memories(
             dkwargs["where"] = where
         drawer_results = drawers_col.query(**dkwargs)
     except Exception as e:
-        return {"error": f"Search error: {e}"}
+        kind = _classify_chroma_error(e)
+        tb = traceback.format_exc()
+        logger.error(
+            "Filtered vector query failed (kind=%s, where=%s): %s\n%s",
+            kind, where, e, tb,
+        )
+        if _STRICT_SEARCH:
+            return {
+                "error": f"Search error ({kind}): {e}",
+                "error_kind": kind,
+                "hint": "Run: python tools/purge_and_repair.py --repair-only --write",
+            }
+        if where:
+            fallback = _fallback_filtered_bm25(drawers_col, query, where, n_results)
+            if fallback["results"]:
+                return {
+                    "query": query,
+                    "filters": {"wing": wing, "room": room},
+                    "total_before_filter": fallback["total_candidates"],
+                    "results": fallback["results"],
+                    "search_mode": "bm25_fallback",
+                    "fallback_reason": str(e),
+                    "fallback_error_kind": kind,
+                    "fallback_truncated": fallback["truncated"],
+                    "warning": (
+                        "Vector index unavailable for this filter; results are"
+                        " lexical-only and may be incomplete. Run"
+                        " `python tools/purge_and_repair.py --repair-only --write`"
+                        " to fix HNSW/metadata divergence."
+                    ),
+                }
+        return {"error": f"Search error ({kind}): {e}", "error_kind": kind}
 
     # Gather closet hits (best-per-source) to build a boost lookup.
     closet_boost_by_source: dict = {}  # source_file -> (rank, closet_dist, preview)

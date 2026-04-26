@@ -543,6 +543,59 @@ def cmd_compress(args):
         print("  (dry run -- nothing stored)")
 
 
+def cmd_distill(args):
+    """Analyze noisy memory drawers and optionally write a verbatim distilled index."""
+    from .distiller import (
+        analyze,
+        delete_drawers_by_tier,
+        write_distilled_drawers,
+        write_report,
+    )
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    report = analyze(
+        palace_path=palace_path,
+        wing=args.wing,
+        room=args.room,
+        limit=args.limit,
+        top_per_room=args.top_per_room,
+        min_score=args.min_score,
+    )
+    paths = write_report(report, output=args.output)
+
+    print(f"  Scanned drawers: {report['scanned']}")
+    print(f"  Report: {paths['markdown']}")
+    print(f"  JSON:   {paths['json']}")
+
+    for room in report["rooms"][:12]:
+        print(
+            f"  {room['wing']}/{room['room']}: "
+            f"promote={room['promote']} review={room['review']} "
+            f"archive_candidate={room['archive_candidate']} total={room['total']}"
+        )
+
+    if args.write:
+        written = write_distilled_drawers(report, palace_path=palace_path, room_name=args.target_room)
+        print(f"  Distilled index drawers written: {len(written)}")
+        for item in written:
+            print(f"    {item['wing']}/{item['room']} {item['drawer_id']} ({item['entries']} entries)")
+    else:
+        print("  Dry run only. Re-run with --write to add distilled verbatim index drawers.")
+
+    if args.delete_archived:
+        if not args.yes:
+            print("  Refusing to delete: pass --yes together with --delete-archived to confirm.")
+            return
+        tiers = ("archive_candidate",)
+        if args.delete_review:
+            tiers = tiers + ("review",)
+        deleted = delete_drawers_by_tier(report, palace_path=palace_path, tiers=tiers)
+        total = sum(deleted.values())
+        print(f"  Deleted originals (tiers={list(tiers)}): {total}")
+        for key, n in sorted(deleted.items(), key=lambda kv: -kv[1])[:20]:
+            print(f"    {key}: -{n}")
+
+
 def main():
     version_label = f"MemPalace {__version__}"
     parser = argparse.ArgumentParser(
@@ -687,6 +740,57 @@ def main():
         "--config", default=None, help="Entity config JSON (e.g. entities.json)"
     )
 
+    # distill
+    p_distill = sub.add_parser(
+        "distill",
+        help="Score noisy drawers and build a layer-friendly verbatim selection report",
+    )
+    p_distill.add_argument("--wing", default=None, help="Limit to one wing")
+    p_distill.add_argument("--room", default=None, help="Limit to one room")
+    p_distill.add_argument("--limit", type=int, default=0, help="Max drawers to scan (0 = all)")
+    p_distill.add_argument(
+        "--top-per-room",
+        type=int,
+        default=8,
+        help="Number of top candidates to keep per room in the report",
+    )
+    p_distill.add_argument(
+        "--min-score",
+        type=int,
+        default=7,
+        help="Score threshold for promotion candidates",
+    )
+    p_distill.add_argument(
+        "--output",
+        default=None,
+        help="Output path base for .json/.md report (default: ~/.mempalace/distill/reports)",
+    )
+    p_distill.add_argument(
+        "--write",
+        action="store_true",
+        help="Write distilled verbatim index drawers into the palace",
+    )
+    p_distill.add_argument(
+        "--target-room",
+        default="distilled",
+        help="Room name for --write distilled index drawers",
+    )
+    p_distill.add_argument(
+        "--delete-archived",
+        action="store_true",
+        help="DESTRUCTIVE: delete original drawers tiered as archive_candidate. Requires --yes.",
+    )
+    p_distill.add_argument(
+        "--delete-review",
+        action="store_true",
+        help="Also delete review-tier drawers (use with --delete-archived)",
+    )
+    p_distill.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm destructive operations",
+    )
+
     # wake-up
     p_wakeup = sub.add_parser("wake-up", help="Show L0 + L1 wake-up context (~600-900 tokens)")
     p_wakeup.add_argument("--wing", default=None, help="Wake-up for a specific project/wing")
@@ -803,6 +907,7 @@ def main():
         "sweep": cmd_sweep,
         "mcp": cmd_mcp,
         "compress": cmd_compress,
+        "distill": cmd_distill,
         "wake-up": cmd_wakeup,
         "repair": cmd_repair,
         "migrate": cmd_migrate,
